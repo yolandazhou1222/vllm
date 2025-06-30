@@ -50,6 +50,7 @@ class QWenMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
+        # 为什么不需要bias:这里设了false
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
@@ -288,26 +289,62 @@ class QWenBaseModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        # 首先，根据权重名字，决定哪些权重应该要被读取。
+        # 例如在pp并行中，每个ModelRunner可能维护不同layer的数据，
+        # 所以当传递过来的权重不是这个ModelRunner所维护的layers范围内时，这个ModelRunner就不会使用它。
+        # 其次，根据分布式配置，决定要读取这个权重的哪一部分。
+        # 例如在tp并行中，每个ModelRunner只维护一个权重块，所以要先对传过来的权重做切割，然后读取自己所维护的那块。
+
+        # 映射，将原始的w1和w2权重合并到gata_up_proj中
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w2", 0),
             ("gate_up_proj", "w1", 1),
         ]
+        '''为什么要这么做：
+        传统的mlp结构是:
+        输入 → w1(gate层) → 激活函数 → w2(up层) → 激活函数 → 合并 → 输出层 → 输出
+        用通俗的例子解释：
+        w1 (gate)：像一个"筛选器"，决定哪些信息重要
+        w2 (up)：像一个"放大器"，增强重要的信息
+        然后两个结果合并处理.
+        但vllm优化后的mlp结构是:
+        输入 → gate_up_proj(合并了w1和w2) → 激活函数 → 输出层 → 输出
+        也就是将w1和w2合并到了gate_up_proj中,
+        可以提高性能：
+        1)减少计算次数
+        原来:需要两次矩阵乘法(一次w1,一次w2)
+        现在:只需要一次矩阵乘法(gate_up_proj)
+        2)内存访问效率
+        原来:需要从内存中读取两个不同的权重矩阵
+        现在:一次读取一个合并的矩阵，减少内存访问次数
+        3)并行计算友好
+        GPU可以更高效地处理一个大矩阵,而不是两个小矩阵
+        '''
+        # 初始化
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # 循环处理权重
         for name, loaded_weight in weights:
+            # 跳过rotary_emb（这是一种特殊权重，不需要加载）
             if "rotary_emb.inv_freq" in name:
                 continue
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                # 如果权重名字不包含w1或w2，则跳过
                 if weight_name not in name:
                     continue
+                # 把权重名字中的weight_name替换为param_name，
+                # 即，把w1或w2替换为gate_up_proj
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
+                # 为什么跳过bias: class QWenMLP中设了bias=False
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip layers on other devices.
+                # （针对分布式的）如果这个权重不属于当前ModelRunner所维护的layers，则跳过
                 if is_pp_missing_parameter(name, self):
                     continue
+                # 加载权重
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -319,6 +356,7 @@ class QWenBaseModel(nn.Module):
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
+                # 如果不匹配任何映射，则用默认加载器加载
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

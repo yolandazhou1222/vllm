@@ -47,6 +47,7 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     if load_config.load_format == LoadFormat.RUNAI_STREAMER_SHARDED:
         return ShardedStateLoader(load_config, runai_model_streamer=True)
 
+    # 默认的是DefaultModelLoader，先看这个。
     return DefaultModelLoader(load_config)
 
 

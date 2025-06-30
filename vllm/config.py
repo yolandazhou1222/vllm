@@ -1755,7 +1755,10 @@ class LoadConfig:
 
 
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
+'''
+EngineCoreProc里的executor有四种,由传入的配置参数--distributed-executor-backend决定.
 
+'''
 
 @config
 @dataclass
@@ -1832,6 +1835,16 @@ class ParallelConfig:
     keep processing on a single host. Otherwise, this will default
     to "ray" if Ray is installed and fail otherwise. Note that tpu
     and hpu only support Ray for distributed inference."""
+    '''
+    4种executor的适用场景:
+    mp:单机多卡. MultiprocExecutor
+        当单机的卡数满足分布式配置,并且没有正在运行的ray pg时,默认用mp.
+        此时,executor成为一个主进程,其下的若干个workers构成了它们的子进程们.
+    ray:多机多卡. RayDistributedExecutor
+        此时,Executor成为一个ray driver process,其下管控着若干worker process.
+    uni: 单卡/Neuron环境. UniProcExecutor
+    external_launcher: 想要使用自定义的外部工具(例如slurm)来做分布式管理.ExecutorWithExternalLauncher.    
+    '''
 
     worker_cls: str = "auto"
     """The full name of the worker class to use. If "auto", the worker class
@@ -1983,6 +1996,7 @@ class ParallelConfig:
         if self.distributed_executor_backend is None and self.world_size > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
+            # 没指定并且是分布式(world_size>1)这时默认用mp
 
             from vllm.executor import ray_utils
             backend: DistributedExecutorBackend = "mp"

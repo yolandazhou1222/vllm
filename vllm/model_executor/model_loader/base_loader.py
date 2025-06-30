@@ -28,6 +28,16 @@ class BaseModelLoader(ABC):
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
 
+    """
+    调用顺序：
+    BaseModelLoader.load_model()--> 
+    (以下都是DefaultModelLoader中的函数)
+    load_weights() 
+        -> get_all_weights()
+            -> _get_weights_iterator()
+                -> _prepare_weights()
+                    -> _maybe_download_from_modelscope() 
+    """
     def load_model(self, vllm_config: VllmConfig,
                    model_config: ModelConfig) -> nn.Module:
         """Load a model with the given configurations."""
@@ -35,9 +45,15 @@ class BaseModelLoader(ABC):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                # 初始化模型架构,还没有加载模型, 只是获得一个model class
                 model = initialize_model(vllm_config=vllm_config,
                                          model_config=model_config)
             # Quantization does not happen in `load_weights` but after it
+            # 加载模型权重
             self.load_weights(model, model_config)
+            # 后处理
             process_weights_after_loading(model, model_config, target_device)
+        # model.eval()是模型的评估模式
+        # 与之相对的是model.train()，训练模式，dropout层会随机丢弃一些神经元，batchnorm层会使用当前batch的统计信息，有一些训练特定行为。
+        # 而评估模式dropout层会停止随机丢弃，而是使用所有神经元；batchnorm层会使用训练时计算的全局统计信息。所以模型在这个模式下能使用最优的配置。    
         return model.eval()

@@ -40,7 +40,78 @@ AnyFuture = Union[asyncio.Future[Any], Future[Any]]
 
 _R = TypeVar('_R')  # Return type for collective_rpc
 
+'''
+v1做的整体流程优化:
+把encode,decode从enginecore里拆出来,放到enginecoreclient里,作为单独的进程,
+于是这部分纯cpu的耗时可以和enginecore的gpu耗时重叠(overlap),于是可以缩短总耗时.
+例如:原先在长文本输入时,detokenize(tokenid-->text)耗时很长,并且这个过程中gpu是空转的,
+现在拆成两个进程后,就可以串行变并行了.
 
+以EngineCoreClient的其中一类SyncMPClient的流程为例: (offline用的)
+step1, add req to
+        llm端接受req,并将req发给llmengine的processor
+step2, process req
+        原始req-->enginecorerequest, 其中processor的作用是对req做预处理,包括：
+        tokenize;验证输入参数的合法性;将req封装成特定形式(enginecorerequest).
+step3, encode & send req
+        将enginecorequest发送给SyncMPClient,
+        然后SyncMPClient会对它做encode:enginecorerequest-->pickle enginecorequest
+        然后通过zmq input_socket,把pickle enginecorerequest发给enginecoreproc.
+        注意,这里SyncMPClient和enginecoreproc是两个不同的进程,vllm用zmq负责进程间的通信.
+********(进程分割线)*********client-->EngineCoreProc********(不同的进程)  
+step4, recv & decode req
+        在enginecoreproc所在的进程上,会启动一个线程,在该线程中执行process_input_socket()函数,这个函数做这些：
+        持续监听通过input_socket传来的pickle enginecorerequest;
+        decode(pickle enginecorequest-->enginecoreqest);
+        将enginecorerequest装入input_queue队列中;
+step5, add req to scheduler
+        enginecorerequest被添加进scheduler的waiting队列中
+step6, one step inference
+        scheduler执行一步推理,从wating和running队列中选择req进行推理,输出一步推理后的结果(enginecoreoutputs)
+step7, put output to output_queue
+        把一步推理结果放到output_queue里,重复执行5 6 7这几步,即重复执行[一步调度-->一步推理]的过程,直到input_queue和scheduler里再也没有req了.
+step8, encode & send req
+********(进程分割线)*********EngineCoreProc-->client********(不同的进程)  
+step9, recv & decode req
+        在syncmpclient所在的进程上,会启动一个线程,在该线程中执行process_outputs_socket()函数,这个函数做这些：
+        持续监听通过output_socket传来的pickle enginecoreoutputs;
+        decode(pickle enginecoreoutputs-->enginecoreoutputs);
+        将enginecoreoutputs装入output_queue队列中;
+step10, process output
+        对EngineCoreOutputs做后处理,比如detokenize.
+step11, output until all reqs are finished.
+        LLM会去检测每一条req是否已做完推理(req.finished==True),
+        当前是offline,所以会一直等待,直到所有req都做完推理,LLM会一起输出推理结果.
+
+再来看AsyncMPClient,即server模式的core client:
+与offline相比,EngineCoreProc部分的逻辑不变,Client和EngineCoreProc交互的逻辑不变,只是Client的实现细节变了.
+step1, async per req generage:
+        用户发送req给vllm的API server,server对单req发起generate()请求,
+        这里会先将req发给AsyncLLM.
+step2, create asynico.queue() for each req, register the queue to output_processor:
+        这两个步骤都在AsyncLLM中完成.
+        create asynico.queue() for each req:会针对每个req创建一个异步队列,用于存储这个req的输出结果.
+        register the queue to output_processor:将这个队列异步注册到output_processor中.
+        为什么每个req要建一个单独的队列:流式输出;有时有多轮对话的需求;
+step3 process req, step4 encode & send req 与offline的逻辑相同.
+********(进程分割线)*********client-->EngineCoreProc********(不同的进程)  
+这里的逻辑也与offlien相同
+********(进程分割线)*********EngineCoreProc-->client********(不同的进程)
+这里会启一个异步任务asyncio.create_task(_run_output_handler),
+这个异步任务上会执行_run_output_handler()函数,
+这个函数的作用:异步接受、处理来自EngineCoreProc的输出结果.具体流程:
+step10, AsyncMPClient.get_output_async():
+        持续监听通过output_socket传来的pickle EngineCoreOutputs;
+        decode(pickle EngineCoreOutputs-->EngineCoreOutputs);
+        将EngineCoreOutputs装入output_queue队列中;
+step11, split output into slices(for streaming)
+        将output_queue中的数据(EngineCoreOutputs)拆分成多个slice,方便后续做流式输出.
+        将slices数据装入这个req注册在output_processor中的队列中、只属于这个req的异步队列中.
+        output_processor会以slices为维度,对输出数据做detokenize等操作.
+step12, continously yield current output:
+        对于一条请求,AsyncLLM将会持续从output_processor中获取它当前的输出结果,返回给用户,直到这条请求推理完毕.
+      
+'''
 class EngineCoreClient(ABC):
     """
     EngineCoreClient: subclasses handle different methods for pushing 

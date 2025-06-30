@@ -88,6 +88,7 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # 先升维，加上激活函数，再降维
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -172,15 +173,21 @@ class Qwen2Attention(nn.Module):
                 "dual_chunk_attention_config": dual_chunk_attention_config,
             } if dual_chunk_attention_config else {})
 
+    # mha
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 把输入向量hidden_states投影成qkv
         qkv, _ = self.qkv_proj(hidden_states)
+        # 拆成q,k,v
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # 给q,k加上位置信息
         q, k = self.rotary_emb(positions, q, k)
+        # 做注意力计算
         attn_output = self.attn(q, k, v)
+        # 把注意力计算的结果投影回原先的hidden_size维度
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -237,27 +244,36 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
 
+    #执行了28*12次
     def forward(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        positions: torch.Tensor,# 位置编码，表示每个词在句子里的意思
+        hidden_states: torch.Tensor,# 输入向量，每个词的语意表示，是前一层的输出，也是当前层的输入
+        residual: Optional[torch.Tensor],# 残差
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        # step1. 准备输入：把输入归一化，保留残差residual
         if residual is None:
+            # 如果没有残差，就把当前输入作为残差保存下来
             residual = hidden_states
+            # 对输入做归一化
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # 如果有残差，就把残差和当前输入一起做归一化
+            # 残差residual的作用：用于与子层输出相加，防止梯度消失
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        # step2. 执行注意力计算，让模型在阅读每个词时，同时看其他词来理解上下文
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
         # Fully Connected
+        # step3. 对注意力计算的结果做归一化
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        # step4. 做mlp(多层感知机)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -340,6 +356,7 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # 如果当前是第一个rank，用input_ids来获取输入向量，残差是none(还没开始做残差连接)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -347,9 +364,11 @@ class Qwen2Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
+            # 如果不是第一个rank，就从intermediate_tensors中获取残差和hidden_states
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        # 遍历所有层，每层都是input_norm-->attention-->post_norm-->mlp,并把hidden_states和残差传递给下一层
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states, residual = layer(
                 positions,
@@ -485,6 +504,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        # 返回每个词的logits，logits是每个词的得分，得分越高，表示这个词越可能被选中
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,

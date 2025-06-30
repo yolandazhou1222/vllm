@@ -25,7 +25,16 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-
+"""
+调用顺序：
+BaseModelLoader.load_model()--> 
+(以下都是DefaultModelLoader中的函数)
+load_weights() 
+    -> get_all_weights()
+        -> _get_weights_iterator()
+            -> _prepare_weights()
+                -> _maybe_download_from_modelscope() 
+"""
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -234,11 +243,20 @@ class DefaultModelLoader(BaseModelLoader):
         return ((source.prefix + name, tensor)
                 for (name, tensor) in weights_iterator)
 
+    # 获取模型的所有权重，返回一个生成器，生成器每次返回一个权重名和权重值
     def get_all_weights(
         self,
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # 权重迭代器返回格式：（权重名称，tensor),比如("model.layers.0.self_attn.q_proj.weight", tensor)
+        # 返回的是完整的、未切割的权重tensor，这个完整权重会被交给modelrunner维护的model
+        # 之后model会根据分布式配置决定如何读取和切片这个权重
+        # 也就是说，在多卡跑（多tp时），每个tp rank都会收到完整的权重，
+        # 之后会有专门的逻辑get_tensor_model_parallel_rank进行切片
+        
+        # primary_weights
+        # 创建一个source对象（DefaultModelLoader 类中的一个内部数据类，用于定义权重数据）
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -248,13 +266,16 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
                                              None),
         )
+        # 用yield生成器获取主权重
         yield from self._get_weights_iterator(primary_weights)
 
+        # secondary_weights
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
+            # yield生成器获取次权重
             yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -266,8 +287,13 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
+        # 用get_all_weights()准备好权重，
+        # 然后用model class的load_weights加载权重，
+        # 比如用vllm/vllm/model_executor/models/qwen2.py中的load_weights()
+        # 返回加载好的权重loaded_weights
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
+        # 记录加载权重的耗时
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
             "Loading weights took %.2f seconds",
@@ -275,6 +301,7 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_before_loading_weights)
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
+        # 只对非量化模型做严格检查，如果没加载完整的话就报错
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:

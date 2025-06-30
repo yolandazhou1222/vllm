@@ -1783,13 +1783,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_token_ids.append(drafter_output.tolist())
         return draft_token_ids
 
+    # executor和Worker.load_model的加载模型最终在这里
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             time_before_load = time.perf_counter()
+            # 核心代码：在这一步完成了：
+            # （1）权重下载（如有必要）
+            # （2）模型架构初始化（每个ModelRunner上维护着自己的切片架构）
+            # （3）权重注入模型架构（一般权重是完整的，在注入模型架构的时候，每个ModelRunner
+            #                    读取自己需要的那部分切片）
+            # 最终返回的结果，self.model = model.eval()
+            # 根据配置选一个加载器model_loader
             model_loader = get_model_loader(self.load_config)
             if not hasattr(self, "model"):
                 logger.info("Loading model from scratch...")
+                # 用加载器加载模型
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config,
                     model_config=self.model_config)

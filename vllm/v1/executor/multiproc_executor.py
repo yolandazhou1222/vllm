@@ -37,7 +37,10 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
-
+# 当前代码结构：
+# Executor -> 
+# 创建多个WorkerProc，每个WorkerProc都self.worker.load_model()
+#                    -> ModelRunner的self.model_runner.load_model()
 class MultiprocExecutor(Executor):
 
     def _init_executor(self) -> None:

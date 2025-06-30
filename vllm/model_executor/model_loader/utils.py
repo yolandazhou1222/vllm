@@ -48,22 +48,27 @@ def initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     if model_config is None:
+        # 如果model_config为空，则使用vllm_config中的model_config
         model_config = vllm_config.model_config
     if model_class is None:
+        # 如果model_class为空，则根据model_config获取对应的模型架构
         model_class, _ = get_model_architecture(model_config)
 
     if vllm_config.quant_config is not None:
+        # 如果有quant_config，则配置量化配置
         configure_quant_config(vllm_config.quant_config, model_class)
 
     signatures = inspect.signature(model_class.__init__)
     all_params = [param.name for param in signatures.parameters.values()]
     if "vllm_config" in all_params and "prefix" in all_params:
         # new-style model class
+        # 如果有vllm_config和prefix参数，就用新风格的model class
         with set_current_vllm_config(vllm_config,
                                      check_compile=True,
                                      prefix=prefix):
             return model_class(vllm_config=vllm_config, prefix=prefix)
 
+    # 打印个警告，让用户更新到新风格的model class
     msg = ("vLLM model class should accept `vllm_config` and `prefix` as "
            "input arguments. Possibly you have an old-style model class"
            " registered from out of tree and it is used for new vLLM version. "
@@ -76,6 +81,7 @@ def initialize_model(
         model_class,
     )
     # try to be compatible with old-style model class
+    # 兼容旧风格的model class
     kwargs = {}
     if "prefix" in all_params:
         kwargs["prefix"] = prefix
@@ -250,6 +256,18 @@ def get_model_architecture(
     elif model_config.task == "reward":
         model_cls = as_reward_model(model_cls)
 
+    return model_cls, arch
+    # vllm类(model_class)：本质是一个python class，形式如<class 'vllm.model_executor.models.qwen.QWenLMHeadModel'>，最终vllm将使用它来初始化ModelRunner上维护的模型架构
+    # hf类：本质是一个string，形式如"QWenLMHeadModel"，最终vllm将使用它来初始化ModelRunner上维护的模型架构
+    # 这两个东西是什么：
+    # 在vllm中，对于各种模型(qwen/llama/etc)，vllm会重写这些模型的架构，以便更好实现分布式推理，以及为推理做特定的优化等。你可以将hf类理解成原始模型，vllm类理解成是这个模型在vllm中的重写实现。
+    # 比如，如果不用vllm, 而是用transformers做原生推理，transformers会读模型config.json里的architectures，然后用QwenLMHeadModel去做实例化；
+    # 那么到了vllm里，vllm会把这个字段值作为key(hf类)，然后去找这个key在vllm中对应的python class实现（vllm类），最终用这个vllm类做实例化。
+    # 这个key-value的映射关系中哪里构建的：registry.py
+
+def get_model_architecture_from_config(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
+    architectures = getattr(model_config.hf_config, "architectures", [])
+    model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
     return model_cls, arch
 
 
