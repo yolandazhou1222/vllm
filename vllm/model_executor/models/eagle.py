@@ -21,7 +21,48 @@ from vllm.sequence import IntermediateTensors
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
+'''
+#eagle:推测解码speculative decoding技术中的草稿模型draft model.
+推测解码是什么:
+用一个小而快的模型(draft model)先生成几个候选token,
+然后用大而准确的模型(target model)来验证这些候选token,
+如果验证通过就采用,否则重新生成.
+这样可以加速文本生成过程.
 
+#transformers架构中的头和尾:
+##头)input embedding输入嵌入:
+把token id转换为embedding向量
+    输入:一个整数序列(token IDs),每个整数代表词汇表中的一个token。
+    输出:一个三维张量 (batch_size, sequence_length, hidden_size)。其中：
+        batch_size:一次处理的样本数
+        sequence_length:输入序列的长度
+        hidden_size:嵌入向量的维度(模型隐藏层大小,如768)
+
+##尾)lm head(language model head):
+将transformers模型最后一层输出的的隐藏状态hidden_state,映射回词汇表上的概率分布(即转换为logits,即每个token的预测概率)
+位置:lm head在解码器后面.
+结构:
+    linear层:将维度为hidden_size的hidden_state映射到维度为vocab_size的向量.
+            (batch_size, sequence_length, hidden_size) -> (batch_size, sequence_length, vocab_size)
+    softmax层:将linear层的输出(维度为vocab_size的向量)应用softmax函数,转换为概率分布.这个分布表示在当前位置,词汇表中每个词作为下一个词(即目标词)出现的概率.
+            output = Softmax(Linear(hidden_state))
+输入:
+    transformers模型最后一层输出的hidden_state张量(batch_size, sequence_length, hidden_size)
+输出:
+    logits张量(batch_size, sequence_length, vocab_size)
+    vocab_size表示该位置对应目标词的预测概率分布
+    
+#当前代码结构:
+EAGLE MODEL:
+   
+
+why:
+EAGLE论文发现第一层的输入层归一化和最后的输出层归一化对性能提升不大
+用这些"虚拟"层替换原有的归一化层，保持接口一致但跳过计算
+这是一种性能优化策略
+
+
+'''
 
 class DummyInputLayerNorm(nn.Module):
 
@@ -70,6 +111,15 @@ class EAGLE(nn.Module):
        applying to both the token embedding and hidden states before projection
        as in DeepSeek MTP, which we found to improve performance as well.
     """
+    '''
+    self.model和self.model.model的区别:
+    在EAGLE类的__init__方法中,self.model是通过ModelRegistry.resolve_model_cls(architectures)获取的模型类,创建的实例.
+    所以architectures为deepseekmtp时,self.model是DeepSeekMTP类的实例.
+    那么self.model.model呢?
+    self.model是DeepSeekMTP类,
+    DeepSeekMTP的__init__方法里的self.model是DeepSeekMultiTokenPredictor类的实例,
+    所以self.model.model是DeepSeekMultiTokenPredictor类的实例.
+    '''
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -78,22 +128,28 @@ class EAGLE(nn.Module):
         self.config = config
 
         architectures = getattr(self.config.model, "architectures", [])
+        # 根据模型的architectures,初始化
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
 
         self.model = model_cls(vllm_config=vllm_config,
                                prefix=maybe_prefix(prefix, "model"))
-
-        self.fc = nn.Linear(config.model.hidden_size * 2,
-                            config.model.hidden_size,
-                            bias=getattr(self.config, "eagle_fc_bias", False))
+        # 特征融合
+        self.fc = nn.Linear(config.model.hidden_size * 2,#输入维度
+                            config.model.hidden_size,#输出维度
+                            bias=getattr(self.config, "eagle_fc_bias", False))#是否使用偏置
 
         # Modify layer normalization and residual connections as suggested
         # in the EAGLE framework: https://github.com/SafeAILab/EAGLE
         # While weights and biases are generally not needed,
         # they are retained here to support certain unit tests
         # (e.g., spec_decode/e2e/test_eagle_correctness.py).
+        # 替换掉第一层和最后一层的归一化层，保持结构不变但加速
         if not hasattr(self.config.model,
                        "skip_prenorm") or self.config.model.skip_prenorm:
+            # !!!报错1:找不到layer0
+            # 因为nextn模型在rank6,当前是rank0.
+            # rank分配策略:load_model<--get_model(config)<--confg里的get_layers_start_end_indeces<--get_pp_indices()
+            # 这个分配策略会尽量避免放到rank0和最后一个rank
             self.model.model.layers[0].input_layernorm = DummyInputLayerNorm(
                 weight=self.model.model.layers[0].input_layernorm.weight)
 
@@ -111,6 +167,9 @@ class EAGLE(nn.Module):
 
         self.orig_vocab_size = config.vocab_size
         self.truncated_vocab_size = config.truncated_vocab_size
+        # 可以截断词汇表,因为草稿模型只需要预测最常用的token,
+        # 减小词汇表大小可以减少计算开销
+        # 可以通过init最后的token_map把小词汇表映射回完整词汇表
         self.unpadded_vocab_size = self.truncated_vocab_size
 
         self.lm_head = ParallelLMHead(
@@ -134,6 +193,8 @@ class EAGLE(nn.Module):
         self.token_map = None
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # !!!报错2: DeepSeekMultiTokenPredictor类里没有get_input_embeddings方法,
+        # 但它有embed_tokens属性,尝试用 return self.model.model.embed_tokens(input_ids)
         return self.model.model.get_input_embeddings(input_ids)
 
     def forward(
@@ -159,7 +220,9 @@ class EAGLE(nn.Module):
             previous_hidden_states = \
                 torch.zeros(batch_size, hidden_dim, device=device)
 
+        # 合并inputs_embeds和之前的hidden_states,作为新的inputs_embeds
         if self.add_para_norm:
+            # enorm和hnorm是干啥的？
             inputs_embeds = torch.cat([
                 self.enorm(inputs_embeds),
                 self.hnorm(previous_hidden_states)
@@ -168,17 +231,23 @@ class EAGLE(nn.Module):
         else:
             inputs_embeds = torch.cat([inputs_embeds, previous_hidden_states],
                                       dim=-1)
-
+        # 调了fc
+        # inputs_embeds: (batch_size, sequence_length, hidden_size * 2)
+        # fc后的inputs_embeds: (batch_size, sequence_length, hidden_size)
         inputs_embeds = self.fc(inputs_embeds)
-
+        # 在位置0处mask掉inputs_embeds
+        # 位置0一般是特殊的开始位置,要掩码防止它干扰正常的序列处理
         inputs_embeds[positions == 0] = 0  # masking inputs at position=0
-
+        # base model的forward
         hidden_states = self.model.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
         )
+        #!!!报错3: DeepSeekMultiTokenPredictor.forward()没有intermediate_tensors参数.
+        # 但DeepSeekMTP.forward()有intermediate_tensors参数.要改吗？
+        # 如果改的话会报新的错:DeepSeekMTP.forward()需要传previous_hidden_states
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -207,6 +276,7 @@ class EAGLE(nn.Module):
         model_weights = {}
         for name, loaded_weight in weights:
             if name == "token_map":
+                # 截断词汇表
                 if self.config.truncated_vocab_size < self.config.vocab_size:
                     self.token_map = nn.Parameter(loaded_weight,
                                                   requires_grad=False)

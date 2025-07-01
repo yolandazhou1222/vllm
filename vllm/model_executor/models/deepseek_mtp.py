@@ -25,6 +25,7 @@ from .utils import maybe_prefix
 
 
 class SharedHead(nn.Module):
+    # 多个mtp层共享的head
 
     def __init__(
         self,
@@ -102,6 +103,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
             )
+            # 循环使用所有的mtp层
             for idx in range(self.mtp_start_layer_idx,
                              self.mtp_start_layer_idx + self.num_mtp_layers)
         })
@@ -258,6 +260,7 @@ class DeepSeekMTP(nn.Module, SupportsPP):
         Rewrite the weight name to match the format of the original model.
         Add .mtp_block for modules in transformer layer block for spec layer
         and rename shared layer weights to be top level.
+        需要重写部分layer name,让预训练权重能正确映射到新的mtp结构里
         """
         spec_layer_weight_names = [
             "embed_tokens", "enorm", "hnorm", "eh_proj", "shared_head"
