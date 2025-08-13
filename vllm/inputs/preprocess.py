@@ -355,6 +355,8 @@ class InputPreprocessor:
 
         inputs: Union[TokenInputs, MultiModalInputs]
         if multi_modal_data := parsed_content.get("multi_modal_data"):
+            # start_time = time.time()
+            # 多模态模型走了这里_process_multimodal，也就是autoprocessor(纯cpu)
             inputs = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,
@@ -363,6 +365,8 @@ class InputPreprocessor:
                 lora_request=lora_request,
                 return_mm_hashes=return_mm_hashes,
             )
+            # end_time = time.time()
+            # logger.info(f"_process_multimodal time cost: {(end_time - start_time) * 1000:.2f}ms")
         else:
             inputs = token_inputs(
                 prompt_token_ids=prompt_token_ids,

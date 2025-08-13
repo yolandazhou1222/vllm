@@ -370,6 +370,8 @@ class Qwen2_5_VisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
+            # 如果没有传入norm_layer，会使用默认的nn.LayerNorm
+            # 但Qwen2_5_VisionTransformer调它的时候实际上传入了RMSNorm
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
@@ -393,13 +395,30 @@ class Qwen2_5_VisionBlock(nn.Module):
             max_seqlen: Optional[int] = None,  # Only used for Flash Attention
             seqlens: Optional[list[int]] = None,  # Only used for xFormers
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x),
-                          cu_seqlens=cu_seqlens,
-                          rotary_pos_emb=rotary_pos_emb,
-                          max_seqlen=max_seqlen,
-                          seqlens=seqlens)
+        # fuse之前：
+        # x = x + self.attn(self.norm1(x),# 做attn并加残差
+        #                   cu_seqlens=cu_seqlens,
+        #                   rotary_pos_emb=rotary_pos_emb,
+        #                   max_seqlen=max_seqlen,
+        #                   seqlens=seqlens)
+        # x = x + self.mlp(self.norm2(x))# 做MLP并加残差
+        # 这里的x已经是原始x+attn的输出，还要再加上mlp的输出，可能有重复的内存读写
 
-        x = x + self.mlp(self.norm2(x))
+        # fused norm后：
+        x_attn = self.attn(self.norm1(x),#只做attn
+                           cu_seqlens=cu_seqlens,
+                           rotary_pos_emb=rotary_pos_emb,
+                           max_seqlen=max_seqlen,
+                           seqlens=seqlens)
+        x_fused_norm, residual = self.norm2(x, residual=x_attn)#只做rmsnorm，但这个rmsnorm里有residual
+        x = residual + self.mlp(x_fused_norm)# 做MLP并加残差
+
+        # norm1和norm2指向的class RMSNorm(layernorm.py)，支持residual：
+        # 如果residual位空，只做归一化，
+        # 如果residual不为空，做x+residual和归一化
+
+        # fused norm的优点：减少内存读写，减少计算量
+
         return x
 
 

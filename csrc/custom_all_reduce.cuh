@@ -28,6 +28,7 @@ namespace vllm {
   } while (0)
 
 // Maximal number of blocks in allreduce kernel.
+//最大的block数量是36
 constexpr int kMaxBlocks = 36;
 
 // Default number of blocks in allreduce kernel.
@@ -50,6 +51,10 @@ using FlagType = uint32_t;
 // sync point. Thus, peer GPU may write counter+1 while current GPU is busy
 // waiting for counter. We use alternating counter array to avoid this
 // possibility.
+// 两次同步需要两组对等计数器：启动和结束操作。
+// 原因是对等 GPU 块可能到达第二个同步点，而当前 GPU 块尚未通过第一个同步点。
+// 因此，对等 GPU 可能会在当前 GPU 忙于等待计数器时写入 counter+1。
+// 我们使用交替计数器数组来避免这种可能性。
 struct Signal {
   alignas(128) FlagType start[kMaxBlocks][8];
   alignas(128) FlagType end[kMaxBlocks][8];
@@ -198,6 +203,7 @@ template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  // 只有前ngpus个thread参与GPU间通信
   if (threadIdx.x < ngpus) {
     auto peer_counter_ptr = &sg.signals[threadIdx.x]->start[blockIdx.x][rank];
     auto self_counter_ptr = &self_sg->start[blockIdx.x][threadIdx.x];
@@ -206,8 +212,9 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     st_flag_volatile(peer_counter_ptr, flag);
     while (ld_flag_volatile(self_counter_ptr) != flag);
   }
-  __syncthreads();
+  __syncthreads();// block内所有线程同步
   // use one thread to update flag
+  //只有第0个thread更新block flag
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
 
@@ -340,9 +347,11 @@ __global__ void __launch_bounds__(512, 1)
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
   // stage 1: reduce scatter
+  // 每个GPU只计算属于自己分片的数据，对该分片内的所有GPU数据进行求和，计算结果存在tmp_out中
   for (int idx = start + tid; idx < end; idx += stride) {
     tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
   }
+  //GPU间同步屏障，用于确保所有GPU完成第一阶段（Reduce-Scatter）后才能进入第二阶段（AllGather）。
   barrier_at_end<ngpus>(sg, self_sg, rank);
 
   // stage 2: allgather. Note: it's important to match the tid between
@@ -350,6 +359,10 @@ __global__ void __launch_bounds__(512, 1)
   // between threads that have the same tid. If thread i computes the sum of
   // start + i in the first stage, then thread i also gathers start + i from
   // all ranks.
+  // 注意：务必匹配两个步骤之间的 tid，因为只有具有相同 tid 的线程才能保证跨设备的可见性。
+  // 如果线程 i 在第一个阶段计算了 start + i 的总和，那么线程 i 也会从所有rank上收集 start + i。
+
+  // 每个GPU从所有其他GPU的tmp_out中收集数据，并将其存储在tmps[i]中
 
   for (int idx = tid; idx < largest_part; idx += stride) {
 #pragma unroll
@@ -522,6 +535,7 @@ class CustomAllreduce {
    * only take a small amount of SMs. Not quite sure the underlying reason,
    * but my guess is that too many SMs will cause contention on NVLink bus.
    */
+  // threads = 512， 每个block里有512个threads线程 
   template <typename T>
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
@@ -539,6 +553,7 @@ class CustomAllreduce {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    //如果处于cuda graph，就用graph_unreg_buffers_
     if (status == cudaStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
@@ -554,19 +569,21 @@ class CustomAllreduce {
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
+    // printf("AllReduce Debug: world_size=%d, size=%d, bytes=%zu (%.2f KB), packed_size=%zu, fully_connected=%s\n", 
+          //  world_size_, size, bytes, bytes/1024.0, sizeof(typename packed_t<T>::P), fully_connected_ ? "true" : "false");
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
 #define REDUCE_CASE(ngpus)                            \
   case ngpus: {                                       \
-    if (world_size_ == 2) {                           \
+    if (world_size_ == 2) {                           \//2卡时用reduce_1stage
       KL(ngpus, cross_device_reduce_1stage);          \
-    } else if (fully_connected_) {                    \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-          (world_size_ <= 8 && bytes < 256 * 1024)) { \
+    } else if (fully_connected_) {                    \//多GPU且是全连接时
+      if ((world_size_ <= 4 && bytes < 512 * 1024) || \//如果4卡且数据量小于512KB，用reduce_1stage
+          (world_size_ <= 8 && bytes < 256 * 1024)) { \//如果8卡且数据量小于256KB，用reduce_1stage
         KL(ngpus, cross_device_reduce_1stage);        \
-      } else {                                        \
+      } else {                                        \//否则用reduce_2stage
         KL(ngpus, cross_device_reduce_2stage);        \
       }                                               \
     }                                                 \
