@@ -1167,9 +1167,20 @@ class RowParallelLinear(LinearBase):
               | .   |
               | A_p |
                -   -
+    A（权重）被按行（第一维度）分割：
+
+              | A_1 |  <- GPU 1 负责
+              | A_2 |  <- GPU 2 负责  
+          A = | ... |
+              | A_p |  <- GPU p 负责
+
+    同时输入X被按列（第二维度）分割：
+          X = [X_1, ..., X_p]
+              GPU1      GPU P
+
     Arguments:
-        input_size: first dimension of matrix A.
-        output_size: second dimension of matrix A.
+        input_size: first dimension of matrix A.权重的第一维度，在各GPU上被分割
+        output_size: second dimension of matrix A.权重的第二维度，在各GPU上保持完整
         bias: If true, add bias. Note that bias is not parallelized.
         input_is_parallel: If true, we assume that the input is already
                            split across the GPUs and we do not split
@@ -1309,6 +1320,10 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        # 矩阵乘：
+        # input shape是 [batch_size, seq_len, input_size/tp_size]
+        # 权重是[input_size/tp_size, output_size]
+        # 所以输出shape是[batch_size, seq_len, output_size]
         output_parallel = self.quant_method.apply(self,
                                                   input_parallel,
                                                   bias=bias_)

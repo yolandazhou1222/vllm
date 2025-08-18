@@ -121,13 +121,16 @@ class Qwen2Attention(nn.Module):
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
+            # kv heads>=tp时，需要确保能整除，这样每张卡能均分kv head
             assert self.total_num_kv_heads % tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        #每个注意力头处理的维度:
         self.head_dim = hidden_size // self.total_num_heads
+        #q处理的维度，每个卡上的注意力头数量*每个头处理的维度
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -144,7 +147,7 @@ class Qwen2Attention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
+            self.total_num_heads * self.head_dim,#attn head总数量*每个head上的维度，也就是hidden_size
             hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -187,6 +190,23 @@ class Qwen2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # 做注意力计算
         attn_output = self.attn(q, k, v)
+        # 所以attn_output的shape是torch.Size([11045, 1024])
+        # 应该是[batch*seq_len, head_per_gpu*dim_per_head]
+        #                         8*128
+        '''
+        qwen2.5-VL-72B,"num_attention_heads": 64,"hidden_size": 8192,
+        tp8,每张卡有8个head, 每个head的维度head_dim=128
+
+        每张卡上有n个head的话
+        attention_output = [
+            head_0_output,    # shape: [batch, seq_len, head_dim]
+            head_1_output,    # shape: [batch, seq_len, head_dim]
+            ...
+            head_n_output     # shape: [batch, seq_len, head_dim]
+        ]
+        shape: [batch, seq_len, head_per_gpu*head_dim]
+        '''
+
         # 把注意力计算的结果投影回原先的hidden_size维度
         output, _ = self.o_proj(attn_output)
         return output
