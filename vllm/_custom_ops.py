@@ -124,6 +124,21 @@ def paged_attention_rocm(
                                       query_start_loc, block_size, max_seq_len,
                                       alibi_slopes, kv_cache_dtype, k_scale,
                                       v_scale, fp8_out_scale)
+    # 怎么从这个追到c的代码？
+    '''
+    pytorch自定义op的命名模式:
+    torch.ops._rocm_C.paged_attention,其中_rocm_C是扩展模块名,paged_attention是在该模块中注册的op名.
+    所以从扩展模块开始追:
+    setup.py中有扩展模块: CMakeExtension(name="vllm._rocm_C")
+    然后根据CMakeExtension的的配置文件CMakeLists.txt,找到扩展模块的源码文件是:
+    set(VLLM_ROCM_EXT_SRC
+    "csrc/rocm/torch_bindings.cpp"
+    "csrc/rocm/skinny_gemms.cu"
+    "csrc/rocm/attention.cu")  这个就是我们要找的paged_attention所在的源码
+    再看看c和python是怎么注册的:csrc/rocm/torch_bindings.cpp:
+    rocm_ops.def(
+      "paged_attention
+    '''
 
 
 def mla_decode_kvcache_cpu(

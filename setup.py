@@ -646,6 +646,7 @@ if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
 
 if _is_hip():
+    # 这里是torch.ops._rocm_C中的扩展模块_rocm_C的定义
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():

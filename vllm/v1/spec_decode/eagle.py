@@ -22,7 +22,59 @@ logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
 
+'''
+**************************整体调用顺序:
+用户请求
+    ↓
+1. LLMEngine.step()
+    ↓ 调用 model_executor.execute_model()
+2. Executor.execute_model() 
+    ↓ 分发到各个worker
+3. Worker.execute_model()
+    ↓ 调用 model_runner.execute_model()
+4. GPUModelRunner.execute_model()
+    ↓ 执行主模型前向传播
+5. Target Model Forward Pass
+    ↓ 获得hidden states后调用
+6. GPUModelRunner.propose_draft_token_ids()
+    ↓ 根据推测解码方法选择proposer
+7. EagleProposer.propose()
+    ↓ 使用target model的hidden states
+8. Eagle Draft Model Forward Pass
+    ↓ 生成候选tokens
+9. RejectionSampler.forward()
+    ↓ 验证候选tokens
+10. 返回最终接受的tokens
 
+**************************why分层架构:
+Engine层:负责整体调度和用户接口
+Executor层:处理分布式执行
+Worker层:具体的计算执行
+ModelRunner层:模型推理的细节实现
+
+**************************eagle内部的调用顺序:
+Target Model执行完毕
+    ↓ 传递hidden states
+EagleProposer.propose()接收输入：
+    - target_token_ids: 目标模型的输入tokens
+    - target_hidden_states: 目标模型的隐藏状态
+    - next_token_ids: 下一个token预测
+    ↓
+EagleProposer内部流程:
+    1. 移位input_ids (准备draft model输入)
+    2. 设置attention metadata
+    3. 执行draft model前向传播
+    4. 生成第一个候选token
+    5. 循环生成剩余候选tokens (如果num_speculative_tokens > 1)
+    ↓
+返回候选tokens矩阵 [batch_size, num_speculative_tokens]
+    ↓ 传递给RejectionSampler
+RejectionSampler验证:
+    1. 计算target model概率分布
+    2. 执行rejection sampling算法
+    3. 接受/拒绝候选tokens
+    4. 生成最终输出tokens
+'''
 class EagleProposer:
 
     def __init__(

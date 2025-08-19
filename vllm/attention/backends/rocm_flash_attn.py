@@ -518,6 +518,10 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             self.logits_soft_cap = logits_soft_cap
         self.attn_type = attn_type
         self.num_heads = num_heads
+        # num_heads是怎么计算的:
+        # 在模型的executor代码里: vllm/model_executor/models/qwen2.py:
+        # self.num_heads = self.total_num_heads // tp_size
+        # 然后传到layer.py里的attn_backend，然后传到这里
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
@@ -675,6 +679,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 " implementation in ROCMFlashAttentionImpl for now")
 
         query = query.view(-1, self.num_heads, self.head_size)
+        # view: 改变tensor的形状,但不改变数据.
+        # -1: 自动计算维度,保持总元素数不变.
         if key is not None:
             assert value is not None
             key = key.view(-1, self.num_kv_heads, self.head_size)
@@ -744,6 +750,10 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
         # Query for decode. KV is not needed because it is already cached.
         decode_query = query[num_prefill_tokens:]
+        # 分离prefill和decode的query:
+        # query: 包含了所有token的查询向量，shape为[total_tokens,num_heads,head_size]
+        # num_prefill_tokens: prefill阶段处理的token的数量
+        # 所以用切片[num_prefill_tokens:]提取出decode阶段需要的query
         # QKV for prefill.
         query = query[:num_prefill_tokens]
 
@@ -892,6 +902,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 decode_meta.max_decode_seq_len, self.sliding_window,
                 self.kv_cache_dtype, self.alibi_slopes)
 
+            # 先判断是不是用custom paged attn,也就是hip pa
             if use_custom:
                 max_seq_len = (decode_meta.max_decode_seq_len if self.attn_type
                                != AttentionType.ENCODER_DECODER else
@@ -939,7 +950,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     layer._v_scale,
                     output_scale,
                 )
-            else:
+            else:# 这个应该是triton pa
                 # PagedAttention does not support fused quant, manually quantize
                 if output_scale is None:
                     out_pa = output[num_prefill_tokens:]
